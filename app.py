@@ -53,6 +53,8 @@ class UploadEngine:
             cls._instance.queue = []
             cls._instance.total_queued = 0
             cls._instance.current_item = None
+            cls._instance.active_exams = []
+            cls._instance.active_lang = ""
             cls._instance.progress = cls._instance.load_progress()
         return cls._instance
 
@@ -60,10 +62,14 @@ class UploadEngine:
         if os.path.exists(PROGRESS_FILE):
             try:
                 with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Restore active state if any
+                    self.active_exams = data.get('selected_exams', [])
+                    self.active_lang = data.get('lang_filter', '')
+                    return data
             except Exception:
                 pass
-        return {"sent_urls": [], "sent_sections": [], "failed": {}}
+        return {"sent_urls": [], "sent_sections": [], "failed": {}, "selected_exams": [], "lang_filter": ""}
 
     def save_progress(self):
         with self.lock:
@@ -218,15 +224,20 @@ class UploadEngine:
                 self.is_running = False
                 self.log("🎉 All queued papers completed successfully!")
 
-    def start_upload(self, items_to_send, bot_tokens, chat_id, section_counts):
+    def start_upload(self, items_to_send, bot_tokens, chat_id, section_counts, selected_exams, lang_filter):
         with self.lock:
             if self.is_running:
                 return False
             self.is_running = True
             self.queue = list(items_to_send)
             self.total_queued = len(items_to_send)
+            self.active_exams = list(selected_exams)
+            self.active_lang = lang_filter
+            self.progress['selected_exams'] = self.active_exams
+            self.progress['lang_filter'] = self.active_lang
+            self.save_progress()
 
-        self.log(f"🚀 Started upload of {self.total_queued} papers using {len(bot_tokens)} bots...")
+        self.log(f"🚀 Started upload of {self.total_queued} papers ({', '.join(selected_exams)}) using {len(bot_tokens)} bots...")
 
         self.worker_threads = []
         for i, token in enumerate(bot_tokens):
@@ -244,7 +255,9 @@ class UploadEngine:
 
     def reset_progress(self):
         with self.lock:
-            self.progress = {"sent_urls": [], "sent_sections": [], "failed": {}}
+            self.progress = {"sent_urls": [], "sent_sections": [], "failed": {}, "selected_exams": [], "lang_filter": ""}
+            self.active_exams = []
+            self.active_lang = ""
             self.save_progress()
         self.log("🔄 Progress history reset.")
 
@@ -284,14 +297,39 @@ st.sidebar.code('BOT_TOKEN_1 = "..."\nBOT_TOKEN_2 = "..."', language="toml")
 catalog = load_catalog()
 available_exams = list(catalog.keys())
 
+# Determine initial default selection:
+# 1. Saved selection from previous session
+# 2. Or All exams excluding RRB NTPC (Group D, ALP, Technician, JE, RPF Constable, RPF SI)
+default_exams = engine.progress.get('selected_exams')
+if not default_exams:
+    default_exams = [e for e in available_exams if e != "RRB NTPC"]
+
+default_lang = engine.progress.get('lang_filter')
+if not default_lang or default_lang not in ["Hindi Medium (Recommended)", "All Available (Hindi + English)", "English Only"]:
+    default_lang = "Hindi Medium (Recommended)"
+
 st.subheader("📚 Select Exams & Filters")
+
+# Quick Selection Buttons
+col_b1, col_b2, col_b3 = st.columns([2, 2, 3])
+with col_b1:
+    if st.button("📌 All Exams (Excluding NTPC)", help="Selects Group D, ALP, Technician, JE, RPF"):
+        st.session_state["selected_exams_key"] = [e for e in available_exams if e != "RRB NTPC"]
+        st.rerun()
+
+with col_b2:
+    if st.button("🌐 Select All (7 Exams)", help="Selects all exams including NTPC"):
+        st.session_state["selected_exams_key"] = list(available_exams)
+        st.rerun()
+
 col1, col2 = st.columns([2, 1])
 
 with col1:
     selected_exams = st.multiselect(
         "Choose Exams to Upload:",
         options=available_exams,
-        default=["RRB Group D", "RRB ALP"] if available_exams else []
+        default=st.session_state.get("selected_exams_key", default_exams),
+        key="selected_exams_key"
     )
 
 with col2:
@@ -301,7 +339,12 @@ with col2:
             "Hindi Medium (Recommended)",
             "All Available (Hindi + English)",
             "English Only"
-        ]
+        ],
+        index=[
+            "Hindi Medium (Recommended)",
+            "All Available (Hindi + English)",
+            "English Only"
+        ].index(default_lang)
     )
 
 # Filter Logic
@@ -325,19 +368,38 @@ for exam in selected_exams:
 
 sent_urls_set = set(engine.progress.get('sent_urls', []))
 pending_papers = [(idx, p) for idx, p in enumerate(filtered_papers, 1) if p['url'] not in sent_urls_set]
-already_sent_count = len(filtered_papers) - len(pending_papers)
 
-# Metrics Row
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Filtered Papers", len(filtered_papers))
-m2.metric("Already Sent", already_sent_count)
-m3.metric("Pending to Send", len(pending_papers))
-m4.metric("Failed Count", len(engine.progress.get('failed', {})))
+# Compute dashboard metrics:
+# If actively uploading in background, show active queue status
+if engine.is_running and engine.total_queued > 0:
+    active_total = engine.total_queued
+    active_remaining = len(engine.queue)
+    active_sent = active_total - active_remaining
+    failed_count = len(engine.progress.get('failed', {}))
 
-# Progress Bar
-if len(filtered_papers) > 0:
-    prog_pct = min(1.0, already_sent_count / len(filtered_papers))
-    st.progress(prog_pct, text=f"Progress: {int(prog_pct * 100)}% ({already_sent_count}/{len(filtered_papers)} sent)")
+    st.success(f"⚡ **Active Cloud Uploading:** {', '.join(engine.active_exams or selected_exams)} | Mode: {engine.active_lang or lang_filter}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Active Upload Target", active_total)
+    m2.metric("Sent in Session", active_sent)
+    m3.metric("Remaining in Queue", active_remaining)
+    m4.metric("Failed Count", failed_count)
+
+    prog_pct = min(1.0, active_sent / active_total) if active_total > 0 else 0.0
+    st.progress(prog_pct, text=f"Active Progress: {int(prog_pct * 100)}% ({active_sent}/{active_total} sent)")
+else:
+    already_sent_count = len(filtered_papers) - len(pending_papers)
+    failed_count = len(engine.progress.get('failed', {}))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Filtered Papers", len(filtered_papers))
+    m2.metric("Already Sent", already_sent_count)
+    m3.metric("Pending to Send", len(pending_papers))
+    m4.metric("Failed Count", failed_count)
+
+    if len(filtered_papers) > 0:
+        prog_pct = min(1.0, already_sent_count / len(filtered_papers))
+        st.progress(prog_pct, text=f"Progress: {int(prog_pct * 100)}% ({already_sent_count}/{len(filtered_papers)} sent)")
 
 # Controls Row
 st.markdown("### 🎮 Controls")
@@ -365,7 +427,7 @@ if start_btn:
     if not valid_tokens:
         st.error("Please configure at least one valid Bot Token!")
     else:
-        success = engine.start_upload(pending_papers, valid_tokens, chat_id, section_counts)
+        success = engine.start_upload(pending_papers, valid_tokens, chat_id, section_counts, selected_exams, lang_filter)
         if success:
             st.success(f"Upload initiated for {len(pending_papers)} papers!")
             st.rerun()
