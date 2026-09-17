@@ -1,0 +1,9 @@
+.streamlit/secrets.toml
+upload_progress.json
+upload_progress.json.tmp
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+.DS_Store
